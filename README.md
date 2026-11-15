@@ -254,13 +254,15 @@ MV 默认的 `GameFont`（`mplus-1m-regular.ttf`）只覆盖日文字形，缺�
 
 ## 技术文档
 
-实现原理、钩子点清单、MV/MZ 差异处理，以及 19 个踩坑复盘（含 `plugins.js` 全局正则导致黑屏、PowerShell 编码地狱、批处理尾部反斜杠转义等）见 **[PITFALLS.md](PITFALLS.md)**。
+实现原理、钩子点清单、MV/MZ 差异处理，以及 20 个踩坑复盘（含 `plugins.js` 全局正则导致黑屏、PowerShell 编码地狱、批处理尾部反斜杠转义、真实存档读档 `null` 槽位回归等）见 **[PITFALLS.md](PITFALLS.md)**。
 
-回归测试覆盖多行整块匹配、`\n` 降级、`\n[x]`/`\N[x]` 大小写兼容、MTool 控制符后缀键、`\N[x]` 二次收集、波浪线变体、字体回退、日文判定与单字符碎片：
+回归测试覆盖多行整块匹配、`\n` 降级、`\n[x]`/`\N[x]` 大小写兼容、MTool 控制符后缀键、`\N[x]` 二次收集、波浪线变体、字体回退、日文判定、单字符碎片，以及真实 MV 存档读档（`makeSaveContents → JsonEx → extractSaveContents → Game_Actor.name()`、`Scene_Load.onSavefileOk`）：
 
 ```bash
 node test/quicktranslator.test.js
 ```
+
+真实引擎/存档用例仅在本地存在 `game_debug/`（含 `rpg_*.js`、`save/*.rpgsave`）时运行；该目录按 `.gitignore` 不入库，缺失时自动跳过，其余用例始终运行。
 
 ---
 

@@ -562,6 +562,38 @@ pause
 
 **教训**：**“字显示成空白”先查字体覆盖范围**。`GameFont` 是日文字体，不是全 CJK 字体；翻译插件不能假设系统会自动回退到中文字形。
 
+### 6.20 读档失败：`JsonEx` 把空角色槽位还原成 `null`
+
+**现象**：新游戏、存档正常，读档一律失败（`Scene_Load` 走 `onLoadFailure` / 提示读档失败）；从 `js/plugins/` 移除 `QuickTranslator.js` 后立刻恢复。
+
+**原因**：`$gameActors._data` 是以角色 ID 为下标的稀疏数组，未入队角色的槽位在 `JsonEx.stringify` 时被写成 `null`，`JsonEx.parse` 解码后仍是 `null`（不是 `undefined`）。插件在 `DataManager.extractSaveContents` 之后遍历角色时先取 `data[i]._actorId` 再判空：
+
+```js
+translateActorEntry(data[i], GAME_ACTOR_FIELDS, data[i]._actorId || i); // null 时 TypeError
+```
+
+真实存档 `file1.rpgsave` 的 71 个槽位里有 39 个 `null`，第一个空洞在索引 7，因此每次读档都抛：
+
+```
+TypeError: Cannot read properties of null (reading '_actorId')
+    at translateGameActors (QuickTranslator.js:901)
+    at DataManager.extractSaveContents (QuickTranslator.js:920)
+```
+
+该异常发生在 `DataManager.loadGameWithoutRescue` 内部，被 `DataManager.loadGame` 的 `try/catch` 吞掉并 `return false`，控制台只留下一条错误，游戏表现为“读档失败”。
+
+**修复**：取 `_actorId` 前先判空，`null` / `undefined` / 稀疏空洞一律跳过：
+
+```js
+for (var i = 1; i < data.length; i++) {
+    var actor = data[i];
+    if (!actor || typeof actor !== 'object') continue;
+    translateActorEntry(actor, GAME_ACTOR_FIELDS, actor._actorId || i);
+}
+```
+
+**教训**：**读档链路上任何遍历都要按“存档里可能是 `null`”写**。`DataManager.loadGame` 的 `try/catch` 只返回 `false`，不区分“文件不存在”和“插件抛异常”；排查读档问题时必须直接调用 `loadGameWithoutRescue` 或复现 `extractSaveContents` 才能看到真实堆栈。回归测试覆盖真实存档读档、读写往返与 `Scene_Load.onSavefileOk`（见 `test/quicktranslator.test.js` 场景 15–18）。
+
 ---
 
 ## 7. MV / MZ 差异对照
@@ -609,6 +641,7 @@ pause
 | MZ 名字框 / 选项框 | 按中文测宽，不截断、不溢出 |
 | 未命中文本 | 日文原样显示，`missing.json` 出现且无纯数字/英文噪音 |
 | 高速跳过对话 | 无卡顿；关闭游戏后遗漏不丢 |
+| 读档 | 含 `null` 角色槽位的真实旧存档可读；`Game_Actor.name()` 返回译文；存档→读档往返正常 |
 | 重复安装 | `plugins.js` 仅一条配置，游戏正常启动 |
 | 卸载 | `.bak` 还原成功；无备份时行过滤干净；游戏回到原版 |
 

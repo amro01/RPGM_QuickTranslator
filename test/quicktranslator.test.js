@@ -143,6 +143,136 @@ function missingKeys(env) {
     return Object.keys(env.missing()).sort();
 }
 
+function Skip(message) {
+    this.message = message;
+}
+
+// ============================================================================
+// 真实 MV 引擎 + 真实存档 harness（仅在本地存在 game_debug/ 时启用）
+// game_debug/ 内含受版权保护的游戏脚本与存档，按 .gitignore 不进仓库；
+// 因此真实读档回归测试在缺少该目录时跳过，其余测试始终运行。
+// ============================================================================
+const REAL_GAME_DIR = path.resolve(__dirname, '..', 'game_debug');
+
+// rpg_core.js 在加载期会 new PIXI.filters.VoidFilter() 并继承 PIXI 类；
+// 存档/读档不涉及渲染，这里用可递归的属性代理做最小占位。
+function makePixiStub() {
+    const target = function Dummy() {};
+    target.prototype = {};
+    return new Proxy(target, {
+        get: function(t, prop) {
+            if (prop === 'prototype') return t.prototype;
+            if (prop === 'call' || prop === 'apply' || prop === 'bind') {
+                return Function.prototype[prop].bind(t);
+            }
+            if (prop === Symbol.toPrimitive) return function() { return 0; };
+            if (!(prop in t)) t[prop] = makePixiStub();
+            return t[prop];
+        },
+        construct: function() { return {}; },
+        apply: function() { return {}; }
+    });
+}
+
+function bootRealGame() {
+    const coreDir = path.join(REAL_GAME_DIR, 'js');
+    const saveDir = path.join(REAL_GAME_DIR, 'save');
+    const dataDir = path.join(REAL_GAME_DIR, 'data');
+    const needed = [
+        path.join(coreDir, 'rpg_managers.js'),
+        path.join(coreDir, 'rpg_objects.js'),
+        path.join(coreDir, 'rpg_windows.js'),
+        path.join(coreDir, 'rpg_scenes.js'),
+        path.join(coreDir, 'libs', 'lz-string.js'),
+        path.join(saveDir, 'file1.rpgsave'),
+        path.join(saveDir, 'global.rpgsave'),
+        path.join(dataDir, 'Actors.json'),
+        path.join(dataDir, 'System.json')
+    ];
+    if (!needed.every(function(file) { return fs.existsSync(file); })) return null;
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qt-real-'));
+    tempDirs.push(dir);
+    fs.mkdirSync(path.join(dir, 'js', 'plugins'), { recursive: true });
+    fs.writeFileSync(
+        path.join(dir, 'js', 'plugins', 'dict.json'),
+        JSON.stringify({ 'たねお': '种子夫' }),
+        'utf8'
+    );
+    fs.mkdirSync(path.join(dir, 'save'), { recursive: true });
+    for (const name of fs.readdirSync(saveDir)) {
+        fs.copyFileSync(path.join(saveDir, name), path.join(dir, 'save', name));
+    }
+
+    const errors = [];
+    const sandbox = {};
+    sandbox.window = sandbox;
+    sandbox.global = sandbox;
+    sandbox.console = {
+        log: function() {},
+        warn: function() {},
+        error: function() {
+            errors.push(Array.prototype.map.call(arguments, function(arg) {
+                return arg && arg.stack ? arg.stack : String(arg);
+            }));
+        }
+    };
+    sandbox.setTimeout = function() { return 0; };
+    sandbox.clearTimeout = function() {};
+    sandbox.setInterval = function() { return 0; };
+    sandbox.clearInterval = function() {};
+    sandbox.navigator = { userAgent: 'node' };
+    sandbox.document = {
+        createElement: function() {
+            return { getContext: function() { return null; }, style: {}, addEventListener: function() {} };
+        },
+        addEventListener: function() {},
+        currentScript: {
+            src: pathToFileURL(path.join(dir, 'js', 'plugins', 'QuickTranslator.js')).href
+        },
+        documentElement: { style: {} },
+        body: { style: {} }
+    };
+    sandbox.location = { href: pathToFileURL(path.join(dir, 'index.html')).href, search: '', hash: '' };
+    sandbox.URL = URL;
+    sandbox.require = require;
+    sandbox.process = process;
+    sandbox.performance = { now: function() { return Date.now(); } };
+    sandbox.addEventListener = function() {};
+    sandbox.PIXI = makePixiStub();
+
+    const context = vm.createContext(sandbox);
+    const loadScript = function(file) {
+        vm.runInContext(fs.readFileSync(file, 'utf8'), context, { filename: path.basename(file) });
+    };
+    ['libs/lz-string.js', 'rpg_core.js', 'rpg_managers.js', 'rpg_objects.js',
+     'rpg_windows.js', 'rpg_scenes.js'].forEach(function(name) {
+        loadScript(path.join(coreDir, name));
+    });
+
+    sandbox.$dataActors = JSON.parse(fs.readFileSync(path.join(dataDir, 'Actors.json'), 'utf8'));
+    sandbox.$dataSystem = JSON.parse(fs.readFileSync(path.join(dataDir, 'System.json'), 'utf8'));
+    vm.runInContext(PLUGIN_SOURCE, context, { filename: 'QuickTranslator.js' });
+
+    // 走 NW.js 本地存档分支，但把存档目录指向临时副本。
+    vm.runInContext('Utils._isNwjs = true', context);
+    sandbox.StorageManager.localFileDirectoryPath = function() {
+        return path.join(dir, 'save') + path.sep;
+    };
+    // 模拟 Scene_Boot 加载数据库时触发 DataManager.onLoad($dataActors)。
+    vm.runInContext('DataManager.onLoad(window.$dataActors)', context);
+
+    return {
+        dir: dir,
+        errors: errors,
+        run: function(code) { return vm.runInContext(code, context); },
+        parseSavefile: function(id) {
+            sandbox.__saveRaw = fs.readFileSync(path.join(dir, 'save', 'file' + id + '.rpgsave'), 'utf8');
+            return vm.runInContext('JsonEx.parse(LZString.decompressFromBase64(__saveRaw))', context);
+        }
+    };
+}
+
 // ============================================================================
 // 场景 1：说话人名先被翻译，拼接后的多行块仍要按原始整块命中
 // ============================================================================
@@ -661,6 +791,104 @@ test('standardFontFace prefers Chinese fonts and keeps GameFont as fallback', fu
         face.indexOf('GameFont') > face.indexOf('SimHei'),
         'GameFont must be a fallback behind Chinese fonts: ' + face
     );
+});
+
+// ============================================================================
+// 场景 15：读档链路 — $gameActors._data 的 null 槽位不得让 extractSaveContents 抛异常
+// 真实存档里未入队角色是 null（JsonEx 不还原成 undefined），修复前这里读
+// data[i]._actorId 直接 TypeError，被 DataManager.loadGame 的 try/catch 吞成“读档失败”。
+// ============================================================================
+test('extractSaveContents skips null and undefined actor slots without throwing', function() {
+    const env = boot({ 'たねお': '种子夫' });
+    const actor = new env.Game_Actor('たねお');
+    const data = [null, actor];
+    data[3] = new env.Game_Actor('たねお');
+    // 索引 2 保持空洞（稀疏数组）：null / undefined / 空槽三种形态都要安全。
+    env.window.$gameActors = { _data: data };
+
+    assert.doesNotThrow(function() {
+        env.DataManager.extractSaveContents({});
+    });
+    assert.strictEqual(actor.name(), '种子夫');
+    assert.strictEqual(data[3].name(), '种子夫');
+    assert.strictEqual(data[0], null);
+    assert.strictEqual(2 in data, false);
+});
+
+// ============================================================================
+// 场景 16：真实 MV 引擎 + 真实旧存档（未汉化）完整读档
+// ============================================================================
+test('real MV save: null actor slots load and Game_Actor.name() is translated', function() {
+    const env = bootRealGame();
+    if (!env) throw new Skip('game_debug/ real MV assets not present');
+
+    const contents = env.parseSavefile(1);
+    const slots = contents.actors._data;
+    const nullSlots = slots.filter(function(value) { return value === null; }).length;
+    assert.ok(nullSlots > 0, 'real save must contain null actor slots');
+    assert.strictEqual(slots[1]._name, 'たねお', 'fixture must be a pre-translation save');
+
+    const loaded = env.run('DataManager.loadGame(1)');
+    assert.strictEqual(loaded, true, 'DataManager.loadGame(1) must succeed; console.error: ' +
+        JSON.stringify(env.errors));
+    assert.strictEqual(env.errors.length, 0);
+
+    assert.strictEqual(env.run('typeof Game_Actor.prototype.name'), 'function',
+        'MV Game_Actor.name must stay a method, not an Object.defineProperty getter');
+    assert.strictEqual(env.run('$gameActors.actor(1).name()'), '种子夫');
+    assert.strictEqual(env.run('$gameSystem._saveCount'), 17);
+});
+
+// ============================================================================
+// 场景 17：QuickTranslator 启用时保存的新存档：makeSaveContents → JsonEx → 再读档
+// ============================================================================
+test('real MV save: save made with the plugin active round-trips through JsonEx', function() {
+    const env = bootRealGame();
+    if (!env) throw new Skip('game_debug/ real MV assets not present');
+    assert.strictEqual(env.run('DataManager.loadGame(1)'), true);
+
+    const result = env.run([
+        '(function() {',
+        '    var json = JsonEx.stringify(DataManager.makeSaveContents());',
+        '    var contents = JsonEx.parse(json);',
+        '    DataManager.extractSaveContents(contents);',
+        '    return { length: json.length, name: $gameActors.actor(1).name(),',
+        '             saveCount: $gameSystem._saveCount };',
+        '})()'
+    ].join('\n'));
+    assert.ok(result.length > 10000, 'serialized save should contain the real game state');
+    assert.strictEqual(result.name, '种子夫');
+    assert.strictEqual(result.saveCount, 17);
+    assert.strictEqual(env.errors.length, 0);
+});
+
+// ============================================================================
+// 场景 18：真实 Scene_Load.onSavefileOk + 真实 global.rpgsave 的存档信息
+// ============================================================================
+test('real MV Scene_Load.onSavefileOk loads save 1 from the real global.rpgsave', function() {
+    const env = bootRealGame();
+    if (!env) throw new Skip('game_debug/ real MV assets not present');
+
+    assert.strictEqual(env.run('DataManager.isThisGameFile(1)'), true);
+    const info = env.run('DataManager.loadSavefileInfo(1)');
+    assert.ok(info && info.title, 'loadSavefileInfo(1) must return the real save metadata');
+    assert.strictEqual(typeof info.playtime, 'string');
+
+    const result = env.run([
+        '(function() {',
+        '    var scene = {',
+        '        savefileId: function() { return 1; },',
+        '        onLoadSuccess: function() { this.loadSuccess = true; },',
+        '        onLoadFailure: function() { this.loadFailure = true; }',
+        '    };',
+        '    Scene_Load.prototype.onSavefileOk.call(scene);',
+        '    return { success: !!scene.loadSuccess, failure: !!scene.loadFailure };',
+        '})()'
+    ].join('\n'));
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.failure, false);
+    assert.strictEqual(env.errors.length, 0);
+    assert.strictEqual(env.run('$gameActors.actor(1).name()'), '种子夫');
 });
 
 const done = (async function main() {
