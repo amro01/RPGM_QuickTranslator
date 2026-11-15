@@ -17,8 +17,12 @@
 //     不写入任何存档数据。
 //   * 先按完整原文匹配；未命中时剥离头部控制标签（如 \SP[normal]）用主体查表；
 //     仍未命中则按内嵌控制符（如 \c[18]）切分，逐段查表后原样拼合。
-//     多行文本另有 \n 降级链：整块 -> 剥离首行后的连续子块 -> 逐行，保留换行。
+//     多行文本另有 \n 降级链：整块 -> 剥离首行后的连续子块 ->
+//     最后一个控制符之后的整块 -> 逐行，保留换行。
+//     键匹配对控制符字母大小写不敏感（\n[1] = \N[1]），并对 〜/～ 兜底。
 //     命中任一段都不再记入 missing；missing.json 记录原始完整文本，不记录碎片。
+//   * 日文 locale 下 standardFontFace 被改成中文字体优先的字体栈，
+//     避免 GameFont (mplus) 缺「异 / 您」等简体字时画成空白。
 //   * 已翻译过的结果与 \N[x] 展开后的结果都会被标记，不会二次翻译或误收集。
 //   * MZ 的说话人名字在 setSpeakerName 处翻译，名字框才能按译文宽度测量。
 //   * 数据库角色名（$dataActors / $gameActors）在加载时翻译，避免 \N[x] 展开残留日文。
@@ -32,6 +36,11 @@
     var FLUSH_DELAY = 800;            // 未翻译文本写盘去抖 (毫秒)
     var COLLECT_ONLY_JAPANESE = true; // 只收集含日文的文本；英文/纯数字源请改为 false
     var QT_DEBUG = false;             // true: 诊断日志直接追加到 <游戏根>/qt_debug.log
+    // MV 默认 GameFont (mplus-1m-regular.ttf) 没有「异 / 您」等简体字，会直接画成空白。
+    // 因此把中文字体排在最前，GameFont 只作为假名/CJK 回退，最后再退到系统 sans-serif。
+    var CJK_FONT_FACE = '"Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", ' +
+        '"Noto Sans CJK SC", "Source Han Sans SC", "SimHei", "Heiti TC", ' +
+        '"Microsoft JhengHei", "GameFont", sans-serif';
     // ----------------------------------------------------------------------
 
     if (typeof require !== 'function' || typeof process === 'undefined') return;
@@ -138,6 +147,9 @@
 
     // ---- 字典 ------------------------------------------------------------
     var dict = Object.create(null); // 无原型，避免 constructor / __proto__ 之类的键误命中
+    // 规范化索引（仅在键需要规范化时才建），用于 \n[1] / \N[1] 与 〜/～ 的兼容查表
+    var dictNorm = Object.create(null);
+    var dictVariant = Object.create(null);
     var entryCount = 0;
     var identitySkipped = 0;
     var metaSkipped = 0;
@@ -149,6 +161,21 @@
             throw new Error('顶层必须是 JSON 对象');
         }
         return data;
+    }
+
+    // MV 的 convertEscapeCharacters 用 /gi 展开 \N / \V / \P / \G，
+    // obtainEscapeCode 也会把任意控制符转成大写，因此控制符字母大小写等价。
+    // 查表时统一成大写；只影响键比较，不改写游戏文本或译文。
+    function normalizeControlCase(text) {
+        if (typeof text !== 'string' || text.indexOf('\\') < 0) return text;
+        return text.replace(/\\([A-Za-z]+)/g, function(match, code) {
+            return '\\' + code.toUpperCase();
+        });
+    }
+
+    // 波浪线 U+301C / U+FF5E 在不同来源里会混用；只在精确查表失败后兜底。
+    function normalizeVariant(text) {
+        return normalizeControlCase(text).replace(/\u301c/g, '\uff5e');
     }
 
     if (dictPath) {
@@ -173,6 +200,10 @@
                 }
                 dict[key] = value;
                 entryCount++;
+                var normKey = normalizeControlCase(key);
+                if (normKey !== key && dictNorm[normKey] === undefined) dictNorm[normKey] = value;
+                var variantKey = normalizeVariant(key);
+                if (variantKey !== normKey && dictVariant[variantKey] === undefined) dictVariant[variantKey] = value;
             });
             console.log('[QuickTranslator] 字典已加载: ' + dictPath + ' (' + entryCount + ' 条' +
                 (identitySkipped ? '，跳过 ' + identitySkipped + ' 条未翻译占位' : '') + ')');
@@ -198,7 +229,7 @@
         try {
             var previous = readObject(missingPath);
             Object.keys(previous).forEach(function(key) {
-                if (key && dict[key] === undefined) missing.add(key);
+                if (key && lookup(key) === undefined) missing.add(key);
             });
             dirty = true; // 顺带清理已补进字典的旧条目
         } catch (e) {
@@ -223,7 +254,7 @@
     }
 
     function collect(text) {
-        if (missing.has(text) || dict[text] !== undefined || !isCollectable(text)) return;
+        if (missing.has(text) || isProcessedOutput(text) || lookup(text) !== undefined || !isCollectable(text)) return;
         missing.add(text);
         dirty = true;
         debugLog('collect', text);
@@ -290,6 +321,8 @@
     // alias:      译文 -> 原始文本，用于说话人名已翻译后还原整块原文再查表。
     var translated = new Set();
     var alias = new Map();
+    // 本插件产出过的显示文本（含局部译文拼接串）。只用于阻止半成品写进 missing.json。
+    var processedOutputs = new Set();
     // 角色名 -> \N[id]，用于识别“中文译文 + \N[x] 展开后的人名”这种半成品行。
     var actorNameControls = [];
 
@@ -297,38 +330,94 @@
     var LEAD_TAGS_RE = /^(?:\\[A-Za-z]+(?:\[[^\]]*\])?)+/;
     // 内嵌控制标签切分用：捕获组让 split 结果按 文本/标签/文本… 交替
     var TAG_SPLIT_RE = /(\\[A-Za-z]+(?:\[[^\]]*\])?)/;
+    // 全局扫描用（控制符后缀链）
+    var TAG_ALL_RE = /\\[A-Za-z]+(?:\[[^\]]*\])?/g;
 
     function lookup(key) {
-        return key && dict[key] !== undefined ? dict[key] : undefined;
+        if (!key) return undefined;
+        if (dict[key] !== undefined) return dict[key];
+        var norm = normalizeControlCase(key);
+        if (norm !== key && dict[norm] !== undefined) return dict[norm];
+        if (dictNorm[norm] !== undefined) return dictNorm[norm];
+        var variant = normalizeVariant(key);
+        if (variant !== norm) {
+            if (dict[variant] !== undefined) return dict[variant];
+            if (dictNorm[variant] !== undefined) return dictNorm[variant];
+        }
+        if (dictVariant[variant] !== undefined) return dictVariant[variant];
+        return undefined;
+    }
+
+    // 译文集合：同时收录控制符大写形式，\n[1] / \N[1] 不会因大小写不同而二次翻译。
+    function rememberTranslated(text) {
+        if (typeof text !== 'string' || text === '') return;
+        translated.add(text);
+        var norm = normalizeControlCase(text);
+        if (norm !== text) translated.add(norm);
+    }
+
+    function wasTranslated(text) {
+        if (translated.has(text)) return true;
+        var norm = normalizeControlCase(text);
+        return norm !== text && translated.has(norm);
+    }
+
+    function rememberProcessedOutput(text) {
+        if (typeof text !== 'string' || text === '') return;
+        processedOutputs.add(text);
+        var norm = normalizeControlCase(text);
+        if (norm !== text) processedOutputs.add(norm);
+    }
+
+    function isProcessedOutput(text) {
+        if (processedOutputs.has(text)) return true;
+        var norm = normalizeControlCase(text);
+        return norm !== text && processedOutputs.has(norm);
+    }
+
+    function aliasGet(key) {
+        if (alias.has(key)) return { found: true, value: alias.get(key) };
+        var norm = normalizeControlCase(key);
+        if (norm !== key && alias.has(norm)) return { found: true, value: alias.get(norm) };
+        return { found: false, value: undefined };
+    }
+
+    function rememberAlias(key, source) {
+        if (!key || key === source || alias.has(key)) return;
+        alias.set(key, source);
+        var norm = normalizeControlCase(key);
+        if (norm !== key && !alias.has(norm)) alias.set(norm, source);
     }
 
     function markTranslated(out, source) {
         if (typeof out !== 'string' || out === '') return out;
-        translated.add(out);
+        rememberTranslated(out);
         var outLines = out.split('\n');
         var srcLines = typeof source === 'string' ? source.split('\n') : null;
         for (var i = 0; i < outLines.length; i++) {
             var line = outLines[i];
             if (!line) continue;
-            translated.add(line);
-            if (srcLines && srcLines[i] !== undefined && srcLines[i] !== line && !alias.has(line)) {
-                alias.set(line, srcLines[i]);
+            rememberTranslated(line);
+            if (srcLines && srcLines[i] !== undefined && srcLines[i] !== line) {
+                rememberAlias(line, srcLines[i]);
             }
         }
-        if (typeof source === 'string' && source !== out && !alias.has(out)) {
-            alias.set(out, source);
+        if (typeof source === 'string' && source !== out) {
+            rememberAlias(out, source);
         }
         return out;
     }
 
     function restoreOriginal(text) {
         if (alias.size === 0) return text;
-        if (alias.has(text)) return alias.get(text);
+        var whole = aliasGet(text);
+        if (whole.found) return whole.value;
         var lines = text.split('\n');
         var changed = false;
         for (var i = 0; i < lines.length; i++) {
-            if (alias.has(lines[i])) {
-                lines[i] = alias.get(lines[i]);
+            var lineAlias = aliasGet(lines[i]);
+            if (lineAlias.found) {
+                lines[i] = lineAlias.value;
                 changed = true;
             }
         }
@@ -356,6 +445,18 @@
         return null;
     }
 
+    // 控制符在文本中的结束位置（从后往前尝试）。MTool 的多行键通常从最后一个
+    // 控制符之后开始，所以只需保证最后一次切分能被尝试到。
+    function controlSuffixEnds(text) {
+        var ends = [];
+        TAG_ALL_RE.lastIndex = 0;
+        var match;
+        while ((match = TAG_ALL_RE.exec(text)) !== null) {
+            ends.push(match.index + match[0].length);
+        }
+        return ends;
+    }
+
     function registerActorName(name, actorId) {
         if (!name || !actorId) return;
         for (var i = 0; i < actorNameControls.length; i++) {
@@ -376,9 +477,9 @@
 
     // \N[x] 展开后的人名与译文模板只差人名本身；规范化后能命中 translated 的行不是原文。
     function isKnownTranslatedLine(line) {
-        if (translated.has(line)) return true;
+        if (wasTranslated(line)) return true;
         var canonical = canonicalizeActorNames(line);
-        return canonical !== line && translated.has(canonical);
+        return canonical !== line && wasTranslated(canonical);
     }
 
     // 多行文本的每一行都已是译文，或确无假名/汉字（标点、数字）：
@@ -406,7 +507,7 @@
     // 单行匹配链：整行 -> 剥头部标签 -> 按内嵌控制符分段 -> 首尾空白。
     // 返回值 hit 表示有可用译文；dictHit 表示确实命中了字典（用于决定是否收集）。
     function translateSimple(text) {
-        if (translated.has(text)) {
+        if (wasTranslated(text)) {
             return { text: text, hit: true, dictHit: false };
         }
 
@@ -451,14 +552,16 @@
         }
 
         var key = text.trim();
-        if (key !== text && lookup(key) !== undefined) {
-            return { text: markTranslated(dict[key], text), hit: true, dictHit: true };
+        var keyHit = key !== text ? lookup(key) : undefined;
+        if (keyHit !== undefined) {
+            return { text: markTranslated(keyHit, text), hit: true, dictHit: true };
         }
 
         return { text: text, hit: false, dictHit: false };
     }
 
-    // 多行降级链：整块（含恢复原始人名后的整块）-> 剥首行后的连续多行子块 -> 逐行。
+    // 多行降级链：整块（含恢复原始人名后的整块）-> 剥首行后的连续多行子块
+    // -> 最后一个控制符之后的整块 -> 逐行。
     // 换行符一律保留。局部命中时，未命中的连续日文行必须照常收集，不能被首行命中吞掉；
     // 只有整块不存在未译日文行时才把完整译文加入 translated，避免半成品被下游短路。
     function translateMultiline(text, deferCollect) {
@@ -512,6 +615,49 @@
             }
         }
 
+        // MTool 导出时会把 \n[1] / \N[1] 这类控制符从键里剥掉，
+        // 多行键往往从“最后一个控制符之后”开始（如 "さんのお家です♡\nさっそく…"）。
+        // 前缀单独走逐行/分段翻译，控制符本身原样保留。
+        var suffixEnds = controlSuffixEnds(text);
+        for (var s = suffixEnds.length - 1; s >= 0; s--) {
+            var end = suffixEnds[s];
+            if (end >= text.length) continue;
+            var suffix = text.slice(end);
+            var lead = '';
+            var leadMatch = /^\n+/.exec(suffix);
+            if (leadMatch) {
+                lead = leadMatch[0];
+                suffix = suffix.slice(lead.length);
+            }
+            if (!suffix) continue;
+            var suffixBlock = lookupLines(suffix.split('\n'));
+            if (!suffixBlock) {
+                var suffixRestored = restoreOriginal(suffix);
+                if (suffixRestored !== suffix) suffixBlock = lookupLines(suffixRestored.split('\n'));
+            }
+            if (!suffixBlock) continue;
+            var prefix = text.slice(0, end);
+            var headBlock = translateLines(prefix.split('\n'), deferCollect, prefix);
+            var tailOut = markTranslated(suffixBlock.hit, suffixBlock.source);
+            var combined = headBlock.text + lead + tailOut;
+            if (!headBlock.hasUnhitJapanese) {
+                markTranslated(combined, text);
+            }
+            return {
+                text: combined,
+                hit: true,
+                dictHit: true,
+                translatedAny: headBlock.translatedAny,
+                hasUnhitJapanese: headBlock.hasUnhitJapanese
+            };
+        }
+
+        return translateLines(lines, deferCollect, text);
+    }
+
+    // 逐行翻译：整块/子块都未命中时的最终降级，也用于控制符前缀。
+    // wholeText 是全未命中时写入 missing.json 的原始文本（保留多行，不记碎片）。
+    function translateLines(lines, deferCollect, wholeText) {
         var outLines = [];
         var anyDictHit = false;
         var anyTranslated = false;
@@ -528,7 +674,7 @@
 
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i];
-            if (translated.has(line)) {
+            if (wasTranslated(line)) {
                 flushRun();
                 outLines.push(line);
                 anyTranslated = true;
@@ -558,12 +704,12 @@
 
         var composed = outLines.join('\n');
         if ((anyDictHit || anyTranslated) && !hasUnhitJapanese) {
-            markTranslated(composed, text);
+            markTranslated(composed, wholeText);
         }
         if (!deferCollect) {
             if (!anyDictHit && !anyTranslated) {
                 // 全未命中：收原始完整文本，而不是逐行碎片。
-                if (hasUnhitJapanese) collect(restoreOriginal(text));
+                if (hasUnhitJapanese) collect(restoreOriginal(wholeText));
             } else {
                 // 局部命中：只收未命中且含日文的原始连续子块（如首行"女神"命中后的 2-4 行）。
                 for (var r = 0; r < runs.length; r++) {
@@ -575,7 +721,8 @@
             text: composed,
             hit: anyDictHit || anyTranslated,
             dictHit: anyDictHit,
-            translatedAny: anyTranslated
+            translatedAny: anyTranslated,
+            hasUnhitJapanese: hasUnhitJapanese
         };
     }
 
@@ -583,20 +730,23 @@
     // 不能被 add 阶段逐行命中的 translated 标记短路，否则多行译文永远轮不到。
     function translate(text, deferCollect, fromMessage) {
         if (typeof text !== 'string' || text === '') return text;
-        if (translated.has(text)) return text;
+        if (wasTranslated(text)) return text;
 
         if (text.indexOf('\n') >= 0) {
             if (!fromMessage && isProcessedComposite(text)) {
                 markTranslated(text);
                 return text;
             }
-            return translateMultiline(text, !!deferCollect).text;
+            var multilineOut = translateMultiline(text, !!deferCollect).text;
+            if (multilineOut !== text) rememberProcessedOutput(multilineOut);
+            return multilineOut;
         }
 
         var result = translateSimple(text);
         if (!result.hit && !deferCollect) {
             collect(text.trim());
         }
+        if (result.text !== text) rememberProcessedOutput(result.text);
         return result.text;
     }
 
@@ -693,6 +843,15 @@
         return _Window_Base_drawText.apply(this, args);
     };
 
+    // 4.5 字体：日文 locale 下 standardFontFace 返回 GameFont，而 mplus 没有
+    //     「异」「您」等简体字，canvas 会直接画成空白。统一改成中文字体优先的字体栈，
+    //     GameFont 只作为假名/CJK 回退；可用文件顶部 CJK_FONT_FACE 覆盖。
+    if (typeof Window_Base.prototype.standardFontFace === 'function') {
+        Window_Base.prototype.standardFontFace = function() {
+            return CJK_FONT_FACE;
+        };
+    }
+
     // 5. 控制符展开：\N[x] 会把译文里的占位展开成运行期人名。
     //    只要输入已被本插件处理，展开结果也标记为已处理，防止二次查表/误收集。
     var _Window_Base_convertEscapeCharacters = Window_Base.prototype.convertEscapeCharacters;
@@ -700,7 +859,8 @@
         Window_Base.prototype.convertEscapeCharacters = function(text) {
             var out = _Window_Base_convertEscapeCharacters.call(this, text);
             if (typeof text === 'string' && typeof out === 'string' && out !== text) {
-                if (translated.has(text) || isProcessedComposite(text)) {
+                if (wasTranslated(text) || isProcessedOutput(text) || isProcessedComposite(text)) {
+                    rememberProcessedOutput(out);
                     markTranslated(out);
                 }
             }

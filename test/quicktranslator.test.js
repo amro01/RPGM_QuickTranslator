@@ -64,11 +64,14 @@ function boot(dict, options) {
         return text;
     };
     Window_Base.prototype.convertEscapeCharacters = function(text) {
-        return text.replace(/\\N\[(\d+)\]/g, function(match, id) {
+        return text.replace(/\\N\[(\d+)\]/gi, function(match, id) {
             const actors = runtime.window.$dataActors;
             const actor = actors && actors[Number(id)];
             return actor ? actor.name : '';
         });
+    };
+    Window_Base.prototype.standardFontFace = function() {
+        return 'GameFont';
     };
 
     function Game_Actor(name) {
@@ -469,6 +472,170 @@ test('Game_Actor name getter translates names loaded from old saves', function()
     const actor = new env.Game_Actor('たねお');
     assert.strictEqual(actor.name(), '种子夫');
     assert.deepStrictEqual(missingKeys(env), []);
+});
+
+// ============================================================================
+// 场景 11：\n[1]（小写）与 \N[1]（大写）必须互相命中，且模板/展开后不二次收集
+// ============================================================================
+const NAME_TEMPLATE_LINES = [
+    '「新しい名前は、\\n[1]大人ですね。',
+    'たしかに、受け付けました」'
+];
+const NAME_TEMPLATE_RESULT = '「新的姓名是，\\N[1]大人，对吧。\n确实，已经受理了」';
+
+test('lowercase \\n[1] message matches an uppercase \\N[1] dict template', function() {
+    const env = boot({
+        'たねお': '种子夫',
+        '「新しい名前は、\\N[1]大人ですね。\nたしかに、受け付けました」':
+            '「新的姓名是，\\N[1]大人，对吧。\n确实，已经受理了」'
+    }, {
+        actors: [null, { name: 'たねお', nickname: '', profile: '' }]
+    });
+    env.DataManager.onLoad(env.window.$dataActors);
+
+    const gm = new env.Game_Message();
+    gm.add(NAME_TEMPLATE_LINES[0]);
+    gm.add(NAME_TEMPLATE_LINES[1]);
+    assert.strictEqual(gm.allText(), NAME_TEMPLATE_RESULT);
+
+    const win = new env.Window_Base();
+    const converted = win.convertEscapeCharacters(gm.allText());
+    assert.ok(converted.indexOf('种子夫') >= 0, 'lowercase \\n[1] must still expand at runtime');
+    win.drawTextEx(converted, 0, 0, 640);
+    assert.deepStrictEqual(missingKeys(env), []);
+});
+
+test('uppercase \\N[1] message matches a lowercase \\n[1] dict template', function() {
+    const env = boot({
+        'たねお': '种子夫',
+        '「新しい名前は、\\n[1]大人ですね。\nたしかに、受け付けました」':
+            '「新的姓名是，\\n[1]大人，对吧。\n确实，已经受理了」'
+    }, {
+        actors: [null, { name: 'たねお', nickname: '', profile: '' }]
+    });
+    env.DataManager.onLoad(env.window.$dataActors);
+
+    const gm = new env.Game_Message();
+    gm.add('「新しい名前は、\\N[1]大人ですね。');
+    gm.add('たしかに、受け付けました」');
+    assert.strictEqual(
+        gm.allText(),
+        '「新的姓名是，\\n[1]大人，对吧。\n确实，已经受理了」'
+    );
+
+    const win = new env.Window_Base();
+    const converted = win.convertEscapeCharacters(gm.allText());
+    assert.ok(converted.indexOf('种子夫') >= 0);
+    win.drawTextEx(converted, 0, 0, 640);
+    assert.deepStrictEqual(missingKeys(env), []);
+});
+
+// ============================================================================
+// 场景 12：MTool 多行键从最后一个控制符之后开始（键里没有 \n[1]），仍要命中
+// ============================================================================
+const MTOOL_SPLIT_DICT = {
+    '「ここが': '「这里就是',
+    'さんのお家です♡\nさっそく中へ入ってみてください♡驚きますよ～♡\nなにせいも……驚きますよ～♡」':
+        '先生的家哦♡\n请马上进去看看吧♡会吓一跳哦～♡\n毕竟妹妹也……会吓一跳哦～♡」',
+    '「うふふ♡': '「呵呵♡',
+    'さんならそう言ってくれると信じていましたよ♡\nよかったですね、ひまりさん♡」':
+        '只要是你的话，我就相信您一定会这么说呢♡\n太好了呢，日鞠小姐♡」',
+    'さん♡まあ、なんて素敵なお名前♡\nまさに種馬になるために生まれてきたような名前ですね♡」':
+        '您♡哎呀，这是多么美妙的名字♡\n简直就像是为了成为种马而出生的名字呢♡」'
+};
+
+test('MTool multi-line keys starting after the last \\n[id] control are matched', function() {
+    const env = boot(MTOOL_SPLIT_DICT);
+
+    const house = new env.Game_Message();
+    house.add('「ここが\\n[1]さんのお家です♡');
+    house.add('さっそく中へ入ってみてください♡驚きますよ～♡');
+    house.add('なにせいも……驚きますよ～♡」');
+    assert.strictEqual(
+        house.allText(),
+        '「这里就是\\n[1]先生的家哦♡\n请马上进去看看吧♡会吓一跳哦～♡\n毕竟妹妹也……会吓一跳哦～♡」'
+    );
+
+    const praise = new env.Game_Message();
+    praise.add('「うふふ♡');
+    praise.add('\\n[1]さんならそう言ってくれると信じていましたよ♡');
+    praise.add('よかったですね、ひまりさん♡」');
+    assert.strictEqual(
+        praise.allText(),
+        '「呵呵♡\n\\n[1]只要是你的话，我就相信您一定会这么说呢♡\n太好了呢，日鞠小姐♡」'
+    );
+
+    const name = new env.Game_Message();
+    name.add('「\\n[1]さん♡まあ、なんて素敵なお名前♡');
+    name.add('まさに種馬になるために生まれてきたような名前ですね♡」');
+    assert.strictEqual(
+        name.allText(),
+        '「\\n[1]您♡哎呀，这是多么美妙的名字♡\n简直就像是为了成为种马而出生的名字呢♡」'
+    );
+
+    assert.deepStrictEqual(missingKeys(env), []);
+});
+
+// ============================================================================
+// 场景 12b：局部译文拼接串（控制符已展开成人名）不得写进 missing.json
+// ============================================================================
+test('partially translated composite with expanded names is never collected', function() {
+    const env = boot({
+        'たねお': '种子夫',
+        'ひまり': '日鞠',
+        'でほぐし、精液でヌルヌルに\nすることで出産をサポートできますよ！」':
+            '用性爱棒来放松，再用精液弄得滑溜溜的\n这样就能帮助生产哦！」'
+    }, {
+        actors: [
+            null,
+            { name: 'たねお', nickname: '', profile: '' },
+            { name: 'ひまり', nickname: '', profile: '' }
+        ]
+    });
+    env.DataManager.onLoad(env.window.$dataActors);
+
+    const gm = new env.Game_Message();
+    gm.add('\\n[1]を\\n[2]でほぐし、精液でヌルヌルに');
+    gm.add('することで出産をサポートできますよ！」');
+    const all = gm.allText();
+    assert.ok(all.indexOf('用性爱棒来放松') >= 0, 'suffix block must be translated');
+
+    const win = new env.Window_Base();
+    const converted = win.convertEscapeCharacters(all);
+    assert.ok(converted.indexOf('种子夫') >= 0 && converted.indexOf('日鞠') >= 0);
+    win.drawTextEx(converted, 0, 0, 640);
+
+    assert.deepStrictEqual(missingKeys(env), []);
+});
+
+// ============================================================================
+// 场景 13：波浪线 U+301C / U+FF5E 的差异只在精确查表失败后兜底
+// ============================================================================
+test('wave dash variant 〜 in the dict matches ～ in the game text', function() {
+    const env = boot({ '「わあ\u301c\u2661': '「哇\u301c\u2661' });
+    const win = new env.Window_Base();
+    win.drawTextEx('「わあ\uff5e\u2661', 0, 0, 640);
+    assert.strictEqual(win.lastDrawEx.text, '「哇\u301c\u2661');
+    assert.deepStrictEqual(missingKeys(env), []);
+});
+
+// ============================================================================
+// 场景 14：GameFont (mplus) 缺简体字，standardFontFace 必须回退到中文字体
+// ============================================================================
+test('standardFontFace prefers Chinese fonts and keeps GameFont as fallback', function() {
+    const env = boot({});
+    const face = new env.Window_Base().standardFontFace();
+
+    assert.strictEqual(typeof face, 'string');
+    assert.notStrictEqual(face, 'GameFont');
+    ['Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'SimHei', 'GameFont', 'sans-serif']
+        .forEach(function(name) {
+            assert.ok(face.indexOf(name) >= 0, name + ' missing from: ' + face);
+        });
+    assert.ok(
+        face.indexOf('GameFont') > face.indexOf('SimHei'),
+        'GameFont must be a fallback behind Chinese fonts: ' + face
+    );
 });
 
 const done = (async function main() {
