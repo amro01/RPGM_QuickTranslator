@@ -25,7 +25,14 @@
 //     避免 GameFont (mplus) 缺「异 / 您」等简体字时画成空白。
 //   * 已翻译过的结果与 \N[x] 展开后的结果都会被标记，不会二次翻译或误收集。
 //   * MZ 的说话人名字在 setSpeakerName 处翻译，名字框才能按译文宽度测量。
-//   * 数据库角色名（$dataActors / $gameActors）在加载时翻译，避免 \N[x] 展开残留日文。
+//   * 数据库静态字段（gameTitle、terms.messages、skills、states、armors、items、
+//     enemies、actors）在 DataManager.onLoad 时翻译，避免“运行时拼接串”绕过模板。
+//   * missing.json 优先记录数据层原始模板（如 %1に %2 のダメージを与えた！），
+//     不再记录 衣蛸Ａに 37 のダメージを与えた！ 这类运行时拼接串。
+//   * 查表精确失败后才会做换行/大小写/全角空格归一，以及已知名字前缀、
+//     动态全角字母、版本后缀的保守回退。
+//   * 检测到多份 dict.json 时会在控制台打印实际加载路径与被忽略路径，
+//     并同时给出 missing.json 的实际输出路径。
 //=============================================================================
 (function() {
     'use strict';
@@ -127,11 +134,13 @@
         process.cwd()
     ]);
 
-    var dictPath = '';
-    for (var i = 0; i < dirs.length && !dictPath; i++) {
+    // 只加载第一份，但把所有命中都记下来；多份字典是“改了文件却不生效”的常见来源。
+    var dictCandidates = [];
+    for (var i = 0; i < dirs.length; i++) {
         var candidate = path.join(dirs[i], DICT_NAME);
-        if (fs.existsSync(candidate)) dictPath = candidate;
+        if (fs.existsSync(candidate)) dictCandidates.push(candidate);
     }
+    var dictPath = dictCandidates.length > 0 ? dictCandidates[0] : '';
 
     var dataDir = '';
     if (dictPath) {
@@ -143,13 +152,22 @@
         dataDir = dataDir || process.cwd();
     }
     var missingPath = path.join(dataDir, MISSING_NAME);
-    debugLog('boot', { rootDir: rootDir, cwd: process.cwd(), dirs: dirs, dictPath: dictPath, missingPath: missingPath });
+    debugLog('boot', { rootDir: rootDir, cwd: process.cwd(), dirs: dirs, dictCandidates: dictCandidates, dictPath: dictPath, missingPath: missingPath });
+    if (dictPath && dictCandidates.length > 1) {
+        console.warn('[QuickTranslator] 检测到 ' + dictCandidates.length + ' 份 ' + DICT_NAME +
+            '；实际加载: ' + dictPath +
+            '；被忽略: ' + dictCandidates.slice(1).join(' | ') +
+            '；missing.json -> ' + missingPath);
+    }
 
     // ---- 字典 ------------------------------------------------------------
     var dict = Object.create(null); // 无原型，避免 constructor / __proto__ 之类的键误命中
     // 规范化索引（仅在键需要规范化时才建），用于 \n[1] / \N[1] 与 〜/～ 的兼容查表
     var dictNorm = Object.create(null);
     var dictVariant = Object.create(null);
+    // 普通文本兜底索引：\r\n -> \n、全角空格 -> 半角空格、ASCII 大小写不敏感。
+    // 只在精确/控制符/波浪线都未命中后使用。
+    var dictLoose = Object.create(null);
     var entryCount = 0;
     var identitySkipped = 0;
     var metaSkipped = 0;
@@ -163,10 +181,25 @@
         return data;
     }
 
+    // 统一换行：\r\n / \r -> \n。只影响匹配与写盘，不改变游戏逻辑。
+    function normalizeNewlines(text) {
+        if (typeof text !== 'string' || text.indexOf('\r') < 0) return text;
+        return text.replace(/\r\n?/g, '\n');
+    }
+
+    // 宽松键：换行归一 + 全角空格 -> 半角空格 + ASCII 小写。
+    function looseKey(text) {
+        if (typeof text !== 'string') return '';
+        return normalizeNewlines(text)
+            .replace(/\u3000/g, ' ')
+            .replace(/[A-Z]/g, function(ch) { return ch.toLowerCase(); });
+    }
+
     // MV 的 convertEscapeCharacters 用 /gi 展开 \N / \V / \P / \G，
     // obtainEscapeCode 也会把任意控制符转成大写，因此控制符字母大小写等价。
     // 查表时统一成大写；只影响键比较，不改写游戏文本或译文。
     function normalizeControlCase(text) {
+        text = normalizeNewlines(text);
         if (typeof text !== 'string' || text.indexOf('\\') < 0) return text;
         return text.replace(/\\([A-Za-z]+)/g, function(match, code) {
             return '\\' + code.toUpperCase();
@@ -198,12 +231,16 @@
                     identitySkipped++;
                     return;
                 }
-                dict[key] = value;
+                var sourceKey = normalizeNewlines(key);
+                value = normalizeNewlines(value);
+                dict[sourceKey] = value;
                 entryCount++;
-                var normKey = normalizeControlCase(key);
-                if (normKey !== key && dictNorm[normKey] === undefined) dictNorm[normKey] = value;
-                var variantKey = normalizeVariant(key);
+                var normKey = normalizeControlCase(sourceKey);
+                if (normKey !== sourceKey && dictNorm[normKey] === undefined) dictNorm[normKey] = value;
+                var variantKey = normalizeVariant(sourceKey);
                 if (variantKey !== normKey && dictVariant[variantKey] === undefined) dictVariant[variantKey] = value;
+                var loose = looseKey(sourceKey);
+                if (loose && dictLoose[loose] === undefined) dictLoose[loose] = value;
             });
             console.log('[QuickTranslator] 字典已加载: ' + dictPath + ' (' + entryCount + ' 条' +
                 (identitySkipped ? '，跳过 ' + identitySkipped + ' 条未翻译占位' : '') + ')');
@@ -243,6 +280,117 @@
     var HAN_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
     var ESCAPE_RE = /\\[A-Za-z]+(?:\[\d+\])?|\\[.!#$%&*+\-\/<=>@^_|~{}\\]/g;
     var MIN_COLLECT_LENGTH = 2; // 单个假名/单个控制符多是插件逐字绘制的碎片，不收集
+    var MIN_SUFFIX_KEY_LEN = 4; // 名字前缀剥离后，后缀至少 4 字符才允许兜底，避免短串误匹配
+
+    // 已知名称（原始 + 译文）。用于“运行时拼接串 -> 数据层模板”的反向识别，
+    // 以及仅在精确匹配失败后的名字前缀兜底。
+    var knownPrefixNames = [];
+    var knownPrefixNameSet = Object.create(null);
+    var knownPrefixNamesSorted = null;
+    var knownSkillNames = [];
+    var knownSkillNameSet = Object.create(null);
+    var knownTitleBase = '';
+    // 数据层处理过的原始文本（title/terms/skills/states/armors/items/enemies/actors）。
+    // 运行时拼接串若能反推回这里，missing.json 只记录干净的原始模板。
+    var dataSourceTexts = new Set();
+    var dataSourceTextsLoose = Object.create(null);
+    var runtimeTemplateCache = new Map();
+
+    function addKnownPrefixName(name) {
+        if (typeof name !== 'string' || name.length < 2 || knownPrefixNameSet[name]) return;
+        knownPrefixNameSet[name] = true;
+        knownPrefixNames.push(name);
+        knownPrefixNamesSorted = null;
+        runtimeTemplateCache.clear();
+    }
+
+    function addKnownSkillName(name) {
+        if (typeof name !== 'string' || name.length < 2 || knownSkillNameSet[name]) return;
+        knownSkillNameSet[name] = true;
+        knownSkillNames.push(name);
+        runtimeTemplateCache.clear();
+    }
+
+    function getKnownPrefixNames() {
+        if (!knownPrefixNamesSorted) {
+            knownPrefixNamesSorted = knownPrefixNames.slice().sort(function(a, b) {
+                return b.length - a.length;
+            });
+        }
+        return knownPrefixNamesSorted;
+    }
+
+    function rememberDataSource(text) {
+        if (typeof text !== 'string' || text === '') return;
+        var normalized = normalizeNewlines(text);
+        dataSourceTexts.add(normalized);
+        var loose = looseKey(normalized);
+        if (loose && dataSourceTextsLoose[loose] === undefined) dataSourceTextsLoose[loose] = normalized;
+        runtimeTemplateCache.clear();
+    }
+
+    function withTemplateNumbers(text) {
+        var index = 2;
+        return text.replace(/\d+/g, function() { return '%' + (index++); });
+    }
+
+    // 把运行时拼接串反推成数据层原始模板。只返回 dataSourceTexts 中确实存在的字符串；
+    // 反推失败时原样返回，绝不凭猜测生成模板。
+    function reverseRuntimeTemplate(text) {
+        if (typeof text !== 'string' || !text) return text;
+        var cached = runtimeTemplateCache.get(text);
+        if (cached !== undefined) return cached;
+
+        var candidates = [];
+        var seen = Object.create(null);
+        function push(value) {
+            if (!value) return;
+            var normalized = normalizeNewlines(value);
+            if (seen[normalized]) return;
+            seen[normalized] = true;
+            candidates.push(normalized);
+        }
+
+        push(text);
+        push(withTemplateNumbers(text));
+
+        var names = getKnownPrefixNames();
+        for (var ni = 0; ni < names.length; ni++) {
+            var name = names[ni];
+            if (text.indexOf(name) !== 0) continue;
+            var prefixLen = name.length;
+            if (/[Ａ-Ｚ]/.test(text.charAt(prefixLen))) prefixLen++;
+            var rest = text.slice(prefixLen);
+            if (!rest) continue;
+            push(rest);
+            push('%1' + rest);
+            push(withTemplateNumbers(rest));
+            push('%1' + withTemplateNumbers(rest));
+
+            for (var si = 0; si < knownSkillNames.length; si++) {
+                var skillName = knownSkillNames[si];
+                if (rest.indexOf(skillName) < 0) continue;
+                var replaced = rest.replace(skillName, '%1');
+                push(replaced);
+                push('%1' + replaced);
+                push(withTemplateNumbers(replaced));
+                push('%1' + withTemplateNumbers(replaced));
+            }
+        }
+
+        var result = text;
+        for (var ci = 0; ci < candidates.length; ci++) {
+            var candidate = candidates[ci];
+            var source = dataSourceTexts.has(candidate) ? candidate : dataSourceTextsLoose[looseKey(candidate)];
+            if (source !== undefined) {
+                result = source;
+                break;
+            }
+        }
+        runtimeTemplateCache.set(text, result);
+        return result;
+    }
+
 
     function isCollectable(text) {
         if (!text) return false;
@@ -254,10 +402,18 @@
     }
 
     function collect(text) {
-        if (missing.has(text) || isProcessedOutput(text) || lookup(text) !== undefined || !isCollectable(text)) return;
-        missing.add(text);
+        if (typeof text !== 'string') return;
+        var normalized = normalizeNewlines(text);
+        if (!normalized || missing.has(normalized) || isProcessedOutput(normalized)) return;
+        var template = reverseRuntimeTemplate(normalized);
+        if (template && template !== normalized) {
+            if (missing.has(template)) return;
+            normalized = template;
+        }
+        if (isProcessedOutput(normalized) || lookup(normalized) !== undefined || !isCollectable(normalized)) return;
+        missing.add(normalized);
         dirty = true;
-        debugLog('collect', text);
+        debugLog('collect', normalized);
         scheduleFlush();
     }
 
@@ -304,6 +460,17 @@
         if (!dirty) return;
         dirty = false;
         try {
+            // 写盘前再做一次模板归并：旧 missing.json 里的运行时拼接串
+            // （如 衣蛸Ａに 37 のダメージを与えた！）会被替换成数据层原始模板。
+            var normalizedMissing = new Set();
+            missing.forEach(function(key) {
+                var normalized = normalizeNewlines(key);
+                var template = reverseRuntimeTemplate(normalized);
+                if (template) normalized = template;
+                if (isProcessedOutput(normalized) || lookup(normalized) !== undefined || !isCollectable(normalized)) return;
+                normalizedMissing.add(normalized);
+            });
+            missing = normalizedMissing;
             var out = {};
             missing.forEach(function(key) { out[key] = ''; });
             fs.writeFileSync(missingPath, JSON.stringify(out, null, 2) + '\n', 'utf8');
@@ -335,6 +502,7 @@
 
     function lookup(key) {
         if (!key) return undefined;
+        key = normalizeNewlines(key);
         if (dict[key] !== undefined) return dict[key];
         var norm = normalizeControlCase(key);
         if (norm !== key && dict[norm] !== undefined) return dict[norm];
@@ -345,6 +513,11 @@
             if (dictNorm[variant] !== undefined) return dictNorm[variant];
         }
         if (dictVariant[variant] !== undefined) return dictVariant[variant];
+        // 最后兜底：大小写/全角空格/换行差异。仅精确匹配全部失败后触发。
+        if (key.length >= 2) {
+            var loose = dictLoose[looseKey(key)];
+            if (loose !== undefined) return loose;
+        }
         return undefined;
     }
 
@@ -504,6 +677,56 @@
         return sawKnown;
     }
 
+    function isKnownName(name) {
+        return !!(knownPrefixNameSet[name] || knownSkillNameSet[name] ||
+            (knownTitleBase && name === knownTitleBase));
+    }
+
+    // 版本后缀只对已知名称/标题生效，避免任意短串剥 _v1.0 后误命中。
+    function lookupVersioned(text) {
+        var match = /^([\s\S]+?)(_v\d+(?:\.\d+)*)$/.exec(text);
+        if (!match || !isKnownName(match[1])) return undefined;
+        var hit = lookup(match[1]);
+        return hit === undefined ? undefined : hit + match[2];
+    }
+
+    // 只剥一个尾部动态全角字母（Game_Troop.makeUniqueNames 的 Ａ/Ｂ…），
+    // 且基名必须是已知角色/敌人/技能名。
+    function lookupDynamicLetter(text) {
+        var match = /^([\s\S]+)([Ａ-Ｚ])$/.exec(text);
+        if (!match) return undefined;
+        if (!knownPrefixNameSet[match[1]] && !knownSkillNameSet[match[1]]) return undefined;
+        var hit = lookup(match[1]);
+        return hit === undefined ? undefined : hit + match[2];
+    }
+
+    // 运行时拼接串：已知角色/敌人名前缀 + 已存在的后缀模板。
+    // 只保留前缀，翻译后半段；后缀键必须至少 MIN_SUFFIX_KEY_LEN 长。
+    function translateByKnownPrefix(text) {
+        if (!text || text.indexOf('\\') >= 0 || text.indexOf('\n') >= 0) return undefined;
+        var names = getKnownPrefixNames();
+        for (var i = 0; i < names.length; i++) {
+            var name = names[i];
+            if (text.indexOf(name) !== 0) continue;
+            if (text.length <= name.length) continue;
+            var prefixLen = name.length;
+            if (/[Ａ-Ｚ]/.test(text.charAt(prefixLen))) prefixLen++;
+            var rest = text.slice(prefixLen);
+            if (rest.length < MIN_SUFFIX_KEY_LEN) continue;
+            var prefix = text.slice(0, prefixLen);
+            // 数据层模板已翻译时，运行时只剩“名字 + 中文后缀”：原样放行。
+            if (wasTranslated(rest) || isProcessedOutput(rest)) return text;
+            var suffixHit = lookup(rest);
+            if (suffixHit === undefined) continue;
+            var nameHit = lookup(name);
+            if (nameHit !== undefined) {
+                prefix = nameHit + text.slice(name.length, prefixLen);
+            }
+            return prefix + suffixHit;
+        }
+        return undefined;
+    }
+
     // 单行匹配链：整行 -> 剥头部标签 -> 按内嵌控制符分段 -> 首尾空白。
     // 返回值 hit 表示有可用译文；dictHit 表示确实命中了字典（用于决定是否收集）。
     function translateSimple(text) {
@@ -555,6 +778,21 @@
         var keyHit = key !== text ? lookup(key) : undefined;
         if (keyHit !== undefined) {
             return { text: markTranslated(keyHit, text), hit: true, dictHit: true };
+        }
+
+        var versionHit = lookupVersioned(text);
+        if (versionHit !== undefined) {
+            return { text: markTranslated(versionHit, text), hit: true, dictHit: true };
+        }
+
+        var letterHit = lookupDynamicLetter(text);
+        if (letterHit !== undefined) {
+            return { text: markTranslated(letterHit, text), hit: true, dictHit: true };
+        }
+
+        var prefixedHit = translateByKnownPrefix(text);
+        if (prefixedHit !== undefined) {
+            return { text: markTranslated(prefixedHit, text), hit: true, dictHit: true };
         }
 
         return { text: text, hit: false, dictHit: false };
@@ -730,6 +968,7 @@
     // 不能被 add 阶段逐行命中的 translated 标记短路，否则多行译文永远轮不到。
     function translate(text, deferCollect, fromMessage) {
         if (typeof text !== 'string' || text === '') return text;
+        text = normalizeNewlines(text);
         if (wasTranslated(text)) return text;
 
         if (text.indexOf('\n') >= 0) {
@@ -879,10 +1118,17 @@
             var field = fields[i];
             if (typeof actor[field] !== 'string' || !actor[field]) continue;
             var isName = field === 'name' || field === '_name';
-            if (isName) registerActorName(actor[field], actorId);
+            if (isName) {
+                registerActorName(actor[field], actorId);
+                addKnownPrefixName(actor[field]);
+            }
+            rememberDataSource(actor[field]);
             var value = translate(actor[field]);
             if (value !== actor[field]) actor[field] = value;
-            if (isName) registerActorName(actor[field], actorId);
+            if (isName) {
+                registerActorName(actor[field], actorId);
+                addKnownPrefixName(actor[field]);
+            }
         }
     }
 
@@ -890,6 +1136,126 @@
         if (typeof window === 'undefined' || !Array.isArray(window.$dataActors)) return;
         for (var i = 1; i < window.$dataActors.length; i++) {
             translateActorEntry(window.$dataActors[i], ACTOR_FIELDS, i);
+        }
+    }
+
+    function translateDataString(value) {
+        if (typeof value !== 'string' || value === '') return value;
+        rememberDataSource(value);
+        return translate(value);
+    }
+
+    function translateFields(object, fields) {
+        if (!object || typeof object !== 'object') return;
+        for (var i = 0; i < fields.length; i++) {
+            var field = fields[i];
+            var value = object[field];
+            var out = translateDataString(value);
+            if (out !== value) object[field] = out;
+        }
+    }
+
+    function translateNameField(object, field, kind) {
+        if (!object) return;
+        var original = object[field];
+        if (typeof original !== 'string' || !original) return;
+        if (kind === 'prefix') addKnownPrefixName(original);
+        if (kind === 'skill') addKnownSkillName(original);
+        rememberDataSource(original);
+        var out = translate(original);
+        if (out !== original) object[field] = out;
+        if (kind === 'prefix') addKnownPrefixName(object[field]);
+        if (kind === 'skill') addKnownSkillName(object[field]);
+    }
+
+    function translateGameTitle(original) {
+        var exact = lookup(original);
+        if (exact !== undefined) return exact;
+        var match = /^([\s\S]+?)(_v\d+(?:\.\d+)*)$/.exec(original);
+        if (match) {
+            var baseHit = lookup(match[1]);
+            if (baseHit !== undefined) {
+                // 回退译文只用于显示；完整标题仍进 missing，避免 base 译文错误时静默。
+                console.warn('[QuickTranslator] 标题缺少完整键，使用版本后缀回退: ' +
+                    original + ' -> ' + match[1] + '；已记入 missing.json');
+                collect(original);
+                return baseHit + match[2];
+            }
+        }
+        return translate(original);
+    }
+
+    function translateSystemData(system) {
+        if (!system || typeof system !== 'object') return;
+        if (typeof system.gameTitle === 'string' && system.gameTitle) {
+            var originalTitle = system.gameTitle;
+            knownTitleBase = originalTitle.replace(/_v\d+(?:\.\d+)*$/, '');
+            rememberDataSource(originalTitle);
+            var titleOut = translateGameTitle(originalTitle);
+            if (titleOut !== originalTitle) {
+                system.gameTitle = titleOut;
+                if (typeof document !== 'undefined' && typeof document.title === 'string' &&
+                    (document.title === originalTitle || !document.title)) {
+                    document.title = titleOut;
+                }
+            }
+        }
+        var terms = system.terms;
+        if (terms && terms.messages && typeof terms.messages === 'object') {
+            Object.keys(terms.messages).forEach(function(key) {
+                var value = terms.messages[key];
+                var out = translateDataString(value);
+                if (out !== value) terms.messages[key] = out;
+            });
+        }
+    }
+
+    function translateSkillDatabase() {
+        if (typeof window === 'undefined' || !Array.isArray(window.$dataSkills)) return;
+        for (var i = 1; i < window.$dataSkills.length; i++) {
+            var skill = window.$dataSkills[i];
+            if (!skill || typeof skill !== 'object') continue;
+            translateNameField(skill, 'name', 'skill');
+            translateFields(skill, ['description', 'message1', 'message2']);
+        }
+    }
+
+    function translateStateDatabase() {
+        if (typeof window === 'undefined' || !Array.isArray(window.$dataStates)) return;
+        for (var i = 1; i < window.$dataStates.length; i++) {
+            var state = window.$dataStates[i];
+            if (!state || typeof state !== 'object') continue;
+            translateNameField(state, 'name', 'plain');
+            translateFields(state, ['message1', 'message2', 'message3', 'message4']);
+        }
+    }
+
+    function translateArmorDatabase() {
+        if (typeof window === 'undefined' || !Array.isArray(window.$dataArmors)) return;
+        for (var i = 1; i < window.$dataArmors.length; i++) {
+            var armor = window.$dataArmors[i];
+            if (!armor || typeof armor !== 'object') continue;
+            translateNameField(armor, 'name', 'plain');
+            translateFields(armor, ['description']);
+        }
+    }
+
+    function translateItemDatabase() {
+        if (typeof window === 'undefined' || !Array.isArray(window.$dataItems)) return;
+        for (var i = 1; i < window.$dataItems.length; i++) {
+            var item = window.$dataItems[i];
+            if (!item || typeof item !== 'object') continue;
+            translateNameField(item, 'name', 'plain');
+            translateFields(item, ['description']);
+        }
+    }
+
+    function translateEnemyDatabase() {
+        if (typeof window === 'undefined' || !Array.isArray(window.$dataEnemies)) return;
+        for (var i = 1; i < window.$dataEnemies.length; i++) {
+            var enemy = window.$dataEnemies[i];
+            if (!enemy || typeof enemy !== 'object') continue;
+            translateNameField(enemy, 'name', 'prefix');
         }
     }
 
@@ -913,8 +1279,22 @@
             var _DataManager_onLoad = DataManager.onLoad;
             DataManager.onLoad = function(object) {
                 var result = _DataManager_onLoad.apply(this, arguments);
-                if (typeof window !== 'undefined' && object === window.$dataActors) {
-                    translateActorDatabase();
+                if (typeof window !== 'undefined' && object) {
+                    if (object === window.$dataSystem) {
+                        translateSystemData(object);
+                    } else if (object === window.$dataActors) {
+                        translateActorDatabase();
+                    } else if (object === window.$dataEnemies) {
+                        translateEnemyDatabase();
+                    } else if (object === window.$dataSkills) {
+                        translateSkillDatabase();
+                    } else if (object === window.$dataStates) {
+                        translateStateDatabase();
+                    } else if (object === window.$dataArmors) {
+                        translateArmorDatabase();
+                    } else if (object === window.$dataItems) {
+                        translateItemDatabase();
+                    }
                 }
                 return result;
             };
