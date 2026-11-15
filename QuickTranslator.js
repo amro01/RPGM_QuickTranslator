@@ -17,9 +17,11 @@
 //     不写入任何存档数据。
 //   * 先按完整原文匹配；未命中时剥离头部控制标签（如 \SP[normal]）用主体查表；
 //     仍未命中则按内嵌控制符（如 \c[18]）切分，逐段查表后原样拼合。
-//     命中任一情况都不再记入 missing；missing.json 记录带标签的完整原文。
-//   * 已翻译过的结果不会被二次翻译（add -> drawTextEx 不会链式替换）。
+//     多行文本另有 \n 降级链：整块 -> 剥离首行后的连续子块 -> 逐行，保留换行。
+//     命中任一段都不再记入 missing；missing.json 记录原始完整文本，不记录碎片。
+//   * 已翻译过的结果与 \N[x] 展开后的结果都会被标记，不会二次翻译或误收集。
 //   * MZ 的说话人名字在 setSpeakerName 处翻译，名字框才能按译文宽度测量。
+//   * 数据库角色名（$dataActors / $gameActors）在加载时翻译，避免 \N[x] 展开残留日文。
 //=============================================================================
 (function() {
     'use strict';
@@ -29,6 +31,7 @@
     var MISSING_NAME = 'missing.json';
     var FLUSH_DELAY = 800;            // 未翻译文本写盘去抖 (毫秒)
     var COLLECT_ONLY_JAPANESE = true; // 只收集含日文的文本；英文/纯数字源请改为 false
+    var QT_DEBUG = false;             // true: 诊断日志直接追加到 <游戏根>/qt_debug.log
     // ----------------------------------------------------------------------
 
     if (typeof require !== 'function' || typeof process === 'undefined') return;
@@ -76,6 +79,37 @@
     if (rootDir) rootDir = path.dirname(rootDir);
     if (!rootDir) rootDir = process.cwd();
 
+    var debugLogPath = '';
+    function resolveDebugLogPath() {
+        if (debugLogPath) return debugLogPath;
+        var candidates = [rootDir, dataDir, process.cwd()];
+        for (var i = 0; i < candidates.length; i++) {
+            if (!candidates[i]) continue;
+            try {
+                if (!fs.statSync(candidates[i]).isDirectory()) continue;
+            } catch (e) {
+                continue;
+            }
+            debugLogPath = path.join(candidates[i], 'qt_debug.log');
+            return debugLogPath;
+        }
+        debugLogPath = path.join(process.cwd(), 'qt_debug.log');
+        return debugLogPath;
+    }
+    function debugLog() {
+        if (!QT_DEBUG) return;
+        try {
+            var parts = [];
+            for (var a = 0; a < arguments.length; a++) {
+                var value = arguments[a];
+                parts.push(typeof value === 'string' ? value : JSON.stringify(value));
+            }
+            fs.appendFileSync(resolveDebugLogPath(), new Date().toISOString() + ' ' + parts.join(' ') + '\n', 'utf8');
+        } catch (e) {
+            // 诊断日志失败绝不能影响游戏
+        }
+    }
+
     var dirs = uniqDirs([
         scriptDir,                            // 插件同目录
         path.join(rootDir, 'js', 'plugins'),  // 标准插件目录
@@ -100,10 +134,13 @@
         dataDir = dataDir || process.cwd();
     }
     var missingPath = path.join(dataDir, MISSING_NAME);
+    debugLog('boot', { rootDir: rootDir, cwd: process.cwd(), dirs: dirs, dictPath: dictPath, missingPath: missingPath });
 
     // ---- 字典 ------------------------------------------------------------
     var dict = Object.create(null); // 无原型，避免 constructor / __proto__ 之类的键误命中
     var entryCount = 0;
+    var identitySkipped = 0;
+    var metaSkipped = 0;
 
     function readObject(file) {
         var raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
@@ -119,23 +156,43 @@
             var data = readObject(dictPath);
             Object.keys(data).forEach(function(key) {
                 var value = data[key];
+                // MTool 导出的元信息不是游戏文本
+                if (!key) return;
+                if (key.indexOf('MTool_Meta_') === 0) {
+                    metaSkipped++;
+                    return;
+                }
                 // 空译文 = 待翻译占位，按未翻译处理
-                if (!key || typeof value !== 'string' || value === '') return;
+                if (typeof value !== 'string' || value === '') return;
+                // MTool 对未翻译条目会把原文原样写回译文；value === key 不是译文。
+                // 若当作已翻译，add 阶段会把这些日文行全部标记为“已处理”，
+                // 导致 allText 的多行整块匹配被短路，且 missing.json 永远为空。
+                if (value === key) {
+                    identitySkipped++;
+                    return;
+                }
                 dict[key] = value;
                 entryCount++;
             });
-            console.log('[QuickTranslator] 字典已加载: ' + dictPath + ' (' + entryCount + ' 条)');
+            console.log('[QuickTranslator] 字典已加载: ' + dictPath + ' (' + entryCount + ' 条' +
+                (identitySkipped ? '，跳过 ' + identitySkipped + ' 条未翻译占位' : '') + ')');
+            debugLog('dict', { path: dictPath, entries: entryCount, identitySkipped: identitySkipped, metaSkipped: metaSkipped });
         } catch (e) {
             console.warn('[QuickTranslator] dict.json 解析失败: ' + e.message);
+            debugLog('dict-error', e.message);
         }
     } else {
         console.warn('[QuickTranslator] 未找到 ' + DICT_NAME + '，已尝试: ' + dirs.join(' | '));
+        debugLog('dict-missing', dirs);
     }
 
     // ---- 未翻译文本收集 --------------------------------------------------
     var missing = new Set();
     var dirty = false;
     var flushTimer = null;
+    // add 时只翻译不收集；若某条消息路径不调用 allText，由这里兜底做一次整块收集。
+    var pendingMessages = [];
+    var finalizeTimer = null;
 
     if (fs.existsSync(missingPath)) {
         try {
@@ -149,19 +206,27 @@
         }
     }
 
-    var JP_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]/;
+    // 只认假名与日文专有符号（々〆〻、半角片假名）；CJK 标点「」。、与通用汉字都不算日文。
+    var JP_RE = /[\u3040-\u309f\u30a0-\u30ff\u3005\u3006\u303b\uff66-\uff9f]/;
+    // 汉字区单独用于“是否可能仍是日文”的保守判断（不用于 missing 收集）。
+    var HAN_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
     var ESCAPE_RE = /\\[A-Za-z]+(?:\[\d+\])?|\\[.!#$%&*+\-\/<=>@^_|~{}\\]/g;
+    var MIN_COLLECT_LENGTH = 2; // 单个假名/单个控制符多是插件逐字绘制的碎片，不收集
 
     function isCollectable(text) {
         if (!text) return false;
         if (COLLECT_ONLY_JAPANESE && !JP_RE.test(text)) return false;
-        return !!text.replace(ESCAPE_RE, '').trim(); // 纯控制符/空白不收集
+        var body = text.replace(ESCAPE_RE, '').trim();
+        if (!body) return false; // 纯控制符/空白
+        if (body.length < MIN_COLLECT_LENGTH) return false;
+        return true;
     }
 
     function collect(text) {
         if (missing.has(text) || dict[text] !== undefined || !isCollectable(text)) return;
         missing.add(text);
         dirty = true;
+        debugLog('collect', text);
         scheduleFlush();
     }
 
@@ -170,8 +235,41 @@
         flushTimer = setTimeout(flush, FLUSH_DELAY);
     }
 
+    function finalizePendingMessages() {
+        if (pendingMessages.length === 0) return;
+        var list = pendingMessages;
+        pendingMessages = [];
+        for (var i = 0; i < list.length; i++) {
+            var message = list[i];
+            if (!message || message._qtFinalized) continue;
+            var source = message._qtSourceTexts;
+            if (source && source.length > 0) {
+                translate(source.join('\n'), false);
+            }
+            message._qtFinalized = true;
+        }
+    }
+
+    function scheduleMessageFinalize() {
+        clearTimeout(finalizeTimer);
+        finalizeTimer = setTimeout(function() {
+            finalizeTimer = null;
+            finalizePendingMessages();
+            flush();
+        }, FLUSH_DELAY);
+    }
+
     function flush() {
         flushTimer = null;
+        if (finalizeTimer !== null) {
+            clearTimeout(finalizeTimer);
+            finalizeTimer = null;
+        }
+        finalizePendingMessages();
+        if (flushTimer !== null) {
+            clearTimeout(flushTimer);
+            flushTimer = null;
+        }
         if (!dirty) return;
         dirty = false;
         try {
@@ -179,59 +277,168 @@
             missing.forEach(function(key) { out[key] = ''; });
             fs.writeFileSync(missingPath, JSON.stringify(out, null, 2) + '\n', 'utf8');
             console.log('[QuickTranslator] 未翻译文本 ' + missing.size + ' 条 -> ' + missingPath);
+            debugLog('flush', { path: missingPath, count: missing.size });
         } catch (e) {
             dirty = true;
             console.warn('[QuickTranslator] 写入 missing.json 失败: ' + e.message);
+            debugLog('flush-error', e.message);
         }
     }
 
     // ---- 翻译 ------------------------------------------------------------
-    var translated = new Set(); // 译文结果，防止 add -> drawTextEx 二次翻译
+    // translated: 本插件产出的译文（多行译文拆成每一行也记录），二次进入直接短路。
+    // alias:      译文 -> 原始文本，用于说话人名已翻译后还原整块原文再查表。
+    var translated = new Set();
+    var alias = new Map();
+    // 角色名 -> \N[id]，用于识别“中文译文 + \N[x] 展开后的人名”这种半成品行。
+    var actorNameControls = [];
 
     // 头部控制标签：\SP[normal]、\C[1]、\N[2] 等，允许连续多个
     var LEAD_TAGS_RE = /^(?:\\[A-Za-z]+(?:\[[^\]]*\])?)+/;
     // 内嵌控制标签切分用：捕获组让 split 结果按 文本/标签/文本… 交替
     var TAG_SPLIT_RE = /(\\[A-Za-z]+(?:\[[^\]]*\])?)/;
 
-    function translate(text) {
-        if (typeof text !== 'string' || text === '') return text;
-        if (translated.has(text)) return text;
+    function lookup(key) {
+        return key && dict[key] !== undefined ? dict[key] : undefined;
+    }
 
-        // 第一阶段：完整原文匹配（字典本身带标签）
-        if (dict[text] !== undefined) {
-            translated.add(dict[text]);
-            return dict[text];
+    function markTranslated(out, source) {
+        if (typeof out !== 'string' || out === '') return out;
+        translated.add(out);
+        var outLines = out.split('\n');
+        var srcLines = typeof source === 'string' ? source.split('\n') : null;
+        for (var i = 0; i < outLines.length; i++) {
+            var line = outLines[i];
+            if (!line) continue;
+            translated.add(line);
+            if (srcLines && srcLines[i] !== undefined && srcLines[i] !== line && !alias.has(line)) {
+                alias.set(line, srcLines[i]);
+            }
+        }
+        if (typeof source === 'string' && source !== out && !alias.has(out)) {
+            alias.set(out, source);
+        }
+        return out;
+    }
+
+    function restoreOriginal(text) {
+        if (alias.size === 0) return text;
+        if (alias.has(text)) return alias.get(text);
+        var lines = text.split('\n');
+        var changed = false;
+        for (var i = 0; i < lines.length; i++) {
+            if (alias.has(lines[i])) {
+                lines[i] = alias.get(lines[i]);
+                changed = true;
+            }
+        }
+        return changed ? lines.join('\n') : text;
+    }
+
+    // 多行候选：先按原样查，再按逐行 trim 后的形态查（游戏里常见 " 「わあ…" 这种行首空格）。
+    function lookupLines(lines) {
+        var raw = lines.join('\n');
+        var hit = lookup(raw);
+        if (hit !== undefined) return { hit: hit, source: raw };
+
+        var trimmed = [];
+        var changed = false;
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line !== lines[i]) changed = true;
+            trimmed.push(line);
+        }
+        if (changed) {
+            var normalized = trimmed.join('\n');
+            hit = lookup(normalized);
+            if (hit !== undefined) return { hit: hit, source: normalized };
+        }
+        return null;
+    }
+
+    function registerActorName(name, actorId) {
+        if (!name || !actorId) return;
+        for (var i = 0; i < actorNameControls.length; i++) {
+            if (actorNameControls[i].name === name) return;
+        }
+        actorNameControls.push({ name: name, control: '\\N[' + actorId + ']' });
+    }
+
+    function canonicalizeActorNames(text) {
+        if (!text || actorNameControls.length === 0) return text;
+        var out = text;
+        for (var i = 0; i < actorNameControls.length; i++) {
+            var item = actorNameControls[i];
+            if (out.indexOf(item.name) >= 0) out = out.split(item.name).join(item.control);
+        }
+        return out;
+    }
+
+    // \N[x] 展开后的人名与译文模板只差人名本身；规范化后能命中 translated 的行不是原文。
+    function isKnownTranslatedLine(line) {
+        if (translated.has(line)) return true;
+        var canonical = canonicalizeActorNames(line);
+        return canonical !== line && translated.has(canonical);
+    }
+
+    // 多行文本的每一行都已是译文，或确无假名/汉字（标点、数字）：
+    // 视为处理过的拼接结果，直接放行。
+    function isProcessedComposite(text) {
+        if (text.indexOf('\n') < 0) return false;
+        var lines = text.split('\n');
+        var sawKnown = false;
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (!line) continue;
+            if (isKnownTranslatedLine(line)) {
+                sawKnown = true;
+                continue;
+            }
+            var plain = line.replace(ESCAPE_RE, '');
+            // 汉字无法区分中文与“纯汉字日文”，不能当作已处理；只有确无汉字的标点/数字行可跳过。
+            if (HAN_RE.test(plain)) return false;
+            if (!JP_RE.test(plain)) continue;
+            return false;
+        }
+        return sawKnown;
+    }
+
+    // 单行匹配链：整行 -> 剥头部标签 -> 按内嵌控制符分段 -> 首尾空白。
+    // 返回值 hit 表示有可用译文；dictHit 表示确实命中了字典（用于决定是否收集）。
+    function translateSimple(text) {
+        if (translated.has(text)) {
+            return { text: text, hit: true, dictHit: false };
         }
 
-        // 第二阶段：剥离头部标签，用主体文本匹配，命中后把标签拼回
+        var hit = lookup(text);
+        if (hit !== undefined) {
+            return { text: markTranslated(hit, text), hit: true, dictHit: true };
+        }
+
         var tags = LEAD_TAGS_RE.exec(text);
         if (tags) {
             var prefix = tags[0];
             var body = text.slice(prefix.length);
-            var hit = body ? dict[body] : undefined;
-            if (hit === undefined && body) {
+            var bodyHit = body ? lookup(body) : undefined;
+            if (bodyHit === undefined && body) {
                 var trimmedBody = body.trim();
-                if (trimmedBody !== body) hit = dict[trimmedBody];
+                if (trimmedBody !== body) bodyHit = lookup(trimmedBody);
             }
-            if (hit !== undefined) {
-                var joined = prefix + hit;
-                translated.add(joined);
-                return joined;
+            if (bodyHit !== undefined) {
+                return { text: markTranslated(prefix + bodyHit, text), hit: true, dictHit: true };
             }
         }
 
-        // 第三阶段：按内嵌控制符切分，逐段查表后原样拼合。
-        // 只要有一段命中即视为整句翻译成功，不再记入 missing。
         var parts = text.split(TAG_SPLIT_RE);
         if (parts.length > 1) {
             var hitAny = false;
             for (var p = 0; p < parts.length; p++) {
                 var part = parts[p];
                 if (!part || p % 2 === 1) continue; // 奇数索引是标签，原样保留
-                var segment = dict[part];
+                var segment = lookup(part);
                 if (segment === undefined) {
                     var trimmedPart = part.trim();
-                    if (trimmedPart !== part) segment = dict[trimmedPart];
+                    if (trimmedPart !== part) segment = lookup(trimmedPart);
                 }
                 if (segment !== undefined) {
                     parts[p] = segment;
@@ -239,32 +446,216 @@
                 }
             }
             if (hitAny) {
-                var composed = parts.join('');
-                translated.add(composed);
-                return composed;
+                return { text: markTranslated(parts.join(''), text), hit: true, dictHit: true };
             }
         }
 
-        // 无标签文本的首尾空白回退
         var key = text.trim();
-        if (key !== text && dict[key] !== undefined) {
-            translated.add(dict[key]);
-            return dict[key];
+        if (key !== text && lookup(key) !== undefined) {
+            return { text: markTranslated(dict[key], text), hit: true, dictHit: true };
         }
 
-        // 所有阶段都未命中：missing 记录带标签的完整原文
-        collect(key);
-        return text;
+        return { text: text, hit: false, dictHit: false };
+    }
+
+    // 多行降级链：整块（含恢复原始人名后的整块）-> 剥首行后的连续多行子块 -> 逐行。
+    // 换行符一律保留。局部命中时，未命中的连续日文行必须照常收集，不能被首行命中吞掉；
+    // 只有整块不存在未译日文行时才把完整译文加入 translated，避免半成品被下游短路。
+    function translateMultiline(text, deferCollect) {
+        var lines = text.split('\n');
+        var block = lookupLines(lines);
+        if (block) {
+            return { text: markTranslated(block.hit, block.source), hit: true, dictHit: true, translatedAny: false };
+        }
+
+        var restored = restoreOriginal(text);
+        if (restored !== text) {
+            block = lookupLines(restored.split('\n'));
+            if (block) {
+                return { text: markTranslated(block.hit, block.source), hit: true, dictHit: true, translatedAny: false };
+            }
+        }
+
+        if (lines.length > 1) {
+            var restLines = lines.slice(1);
+            var rest = restLines.join('\n');
+            var restBlock = lookupLines(restLines);
+            if (!restBlock) {
+                var restRestored = restoreOriginal(rest);
+                if (restRestored !== rest) {
+                    restBlock = lookupLines(restRestored.split('\n'));
+                }
+            }
+            if (restBlock) {
+                var restOut = markTranslated(restBlock.hit, restBlock.source);
+                var head = lines[0];
+                var headHasJapanese = false;
+                if (!isKnownTranslatedLine(head)) {
+                    var headResult = translateSimple(head);
+                    head = headResult.text;
+                    if (!headResult.hit && JP_RE.test(head.replace(ESCAPE_RE, ''))) {
+                        headHasJapanese = true;
+                    }
+                }
+                var suffixComposed = head + '\n' + restOut;
+                if (!headHasJapanese) {
+                    markTranslated(suffixComposed, text);
+                } else if (!deferCollect) {
+                    collect(restoreOriginal(head));
+                }
+                return {
+                    text: suffixComposed,
+                    hit: true,
+                    dictHit: true,
+                    translatedAny: false
+                };
+            }
+        }
+
+        var outLines = [];
+        var anyDictHit = false;
+        var anyTranslated = false;
+        var hasUnhitJapanese = false;
+        var runs = [];
+        var run = [];
+
+        function flushRun() {
+            if (run.length > 0) {
+                runs.push(run.join('\n'));
+                run = [];
+            }
+        }
+
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (translated.has(line)) {
+                flushRun();
+                outLines.push(line);
+                anyTranslated = true;
+                continue;
+            }
+            var result = translateSimple(line);
+            outLines.push(result.text);
+            if (result.dictHit) {
+                flushRun();
+                anyDictHit = true;
+                anyTranslated = true;
+            } else if (result.hit) {
+                flushRun();
+                anyTranslated = true;
+            } else if (isKnownTranslatedLine(line)) {
+                // 例如 "\N[1]" 已展开成日文人名的中文译文行；不是待翻译原文。
+                flushRun();
+                anyTranslated = true;
+            } else if (JP_RE.test(line.replace(ESCAPE_RE, ''))) {
+                hasUnhitJapanese = true;
+                run.push(line);
+            } else {
+                flushRun();
+            }
+        }
+        flushRun();
+
+        var composed = outLines.join('\n');
+        if ((anyDictHit || anyTranslated) && !hasUnhitJapanese) {
+            markTranslated(composed, text);
+        }
+        if (!deferCollect) {
+            if (!anyDictHit && !anyTranslated) {
+                // 全未命中：收原始完整文本，而不是逐行碎片。
+                if (hasUnhitJapanese) collect(restoreOriginal(text));
+            } else {
+                // 局部命中：只收未命中且含日文的原始连续子块（如首行"女神"命中后的 2-4 行）。
+                for (var r = 0; r < runs.length; r++) {
+                    collect(restoreOriginal(runs[r]));
+                }
+            }
+        }
+        return {
+            text: composed,
+            hit: anyDictHit || anyTranslated,
+            dictHit: anyDictHit,
+            translatedAny: anyTranslated
+        };
+    }
+
+    // fromMessage: Game_Message.allText 的原始行块。必须先尝试整块/子块字典，
+    // 不能被 add 阶段逐行命中的 translated 标记短路，否则多行译文永远轮不到。
+    function translate(text, deferCollect, fromMessage) {
+        if (typeof text !== 'string' || text === '') return text;
+        if (translated.has(text)) return text;
+
+        if (text.indexOf('\n') >= 0) {
+            if (!fromMessage && isProcessedComposite(text)) {
+                markTranslated(text);
+                return text;
+            }
+            return translateMultiline(text, !!deferCollect).text;
+        }
+
+        var result = translateSimple(text);
+        if (!result.hit && !deferCollect) {
+            collect(text.trim());
+        }
+        return result.text;
     }
 
     // ---- 钩子 ------------------------------------------------------------
-    // 1. 剧情文本：在控制符被解析之前替换
+    // 1. 剧情文本：保存原始行后逐行翻译；收集延后到 allText，避免多行键被拆碎误收。
     var _Game_Message_add = Game_Message.prototype.add;
     Game_Message.prototype.add = function(text) {
         var args = Array.prototype.slice.call(arguments);
-        args[0] = translate(text);
+        if (typeof text === 'string') {
+            // 正常情况下 clear 已重置；若被插件绕过了 clear，至少在新消息开头对齐一次。
+            if (!Array.isArray(this._qtSourceTexts) || !this._texts || this._texts.length === 0) {
+                this._qtSourceTexts = [];
+            }
+            this._qtSourceTexts.push(text);
+            this._qtAllCache = null;
+            this._qtFinalized = false;
+            if (pendingMessages.indexOf(this) < 0) pendingMessages.push(this);
+            scheduleMessageFinalize();
+        }
+        args[0] = translate(text, true);
+        if (typeof text === 'string') debugLog('add', { source: text, out: args[0] });
         return _Game_Message_add.apply(this, args);
     };
+
+    // 整块优先：add 的逐行翻译不会污染原始多行块；allText 用未变脏的原始行整体查表，
+    // 整块未命中再进入 \n 降级链（剥首行子块 -> 逐行）。
+    var _Game_Message_allText = Game_Message.prototype.allText;
+    if (typeof _Game_Message_allText === 'function') {
+        Game_Message.prototype.allText = function() {
+            var source = this._qtSourceTexts;
+            var texts = this._texts || [];
+            var out;
+            if (source && source.length > 0 && source.length === texts.length) {
+                var cache = this._qtAllCache;
+                if (cache && cache.length === source.length) {
+                    this._qtFinalized = true;
+                    return cache.text;
+                }
+                out = translate(source.join('\n'), false, true);
+                debugLog('allText', { source: source.join('\n'), out: out });
+                this._qtAllCache = { length: source.length, text: out };
+            } else {
+                out = translate(_Game_Message_allText.apply(this, arguments), false);
+            }
+            this._qtFinalized = true;
+            return out;
+        };
+    }
+
+    var _Game_Message_clear = Game_Message.prototype.clear;
+    if (typeof _Game_Message_clear === 'function') {
+        Game_Message.prototype.clear = function() {
+            var result = _Game_Message_clear.apply(this, arguments);
+            this._qtSourceTexts = [];
+            this._qtAllCache = null;
+            this._qtFinalized = true;
+            return result;
+        };
+    }
 
     // MZ：说话人名字同样写入消息状态，名字框才能按译文测量宽度
     if (typeof Game_Message.prototype.setSpeakerName === 'function') {
@@ -301,6 +692,90 @@
         args[0] = translate(text);
         return _Window_Base_drawText.apply(this, args);
     };
+
+    // 5. 控制符展开：\N[x] 会把译文里的占位展开成运行期人名。
+    //    只要输入已被本插件处理，展开结果也标记为已处理，防止二次查表/误收集。
+    var _Window_Base_convertEscapeCharacters = Window_Base.prototype.convertEscapeCharacters;
+    if (typeof _Window_Base_convertEscapeCharacters === 'function') {
+        Window_Base.prototype.convertEscapeCharacters = function(text) {
+            var out = _Window_Base_convertEscapeCharacters.call(this, text);
+            if (typeof text === 'string' && typeof out === 'string' && out !== text) {
+                if (translated.has(text) || isProcessedComposite(text)) {
+                    markTranslated(out);
+                }
+            }
+            return out;
+        };
+    }
+
+    // 6. 数据库角色名：\N[x] 展开取的是 $dataActors / $gameActors 的名字，
+    //    只在 draw 时翻译字符串不够，必须在数据层先换掉。
+    var ACTOR_FIELDS = ['name', 'nickname', 'profile'];
+    var GAME_ACTOR_FIELDS = ['_name', '_nickname', '_profile'];
+
+    function translateActorEntry(actor, fields, actorId) {
+        if (!actor || typeof actor !== 'object') return;
+        for (var i = 0; i < fields.length; i++) {
+            var field = fields[i];
+            if (typeof actor[field] !== 'string' || !actor[field]) continue;
+            var isName = field === 'name' || field === '_name';
+            if (isName) registerActorName(actor[field], actorId);
+            var value = translate(actor[field]);
+            if (value !== actor[field]) actor[field] = value;
+            if (isName) registerActorName(actor[field], actorId);
+        }
+    }
+
+    function translateActorDatabase() {
+        if (typeof window === 'undefined' || !Array.isArray(window.$dataActors)) return;
+        for (var i = 1; i < window.$dataActors.length; i++) {
+            translateActorEntry(window.$dataActors[i], ACTOR_FIELDS, i);
+        }
+    }
+
+    function translateGameActors() {
+        if (typeof window === 'undefined' || !window.$gameActors) return;
+        var data = window.$gameActors._data;
+        if (!Array.isArray(data)) return;
+        for (var i = 1; i < data.length; i++) {
+            translateActorEntry(data[i], GAME_ACTOR_FIELDS, data[i]._actorId || i);
+        }
+    }
+
+    if (typeof DataManager !== 'undefined') {
+        if (typeof DataManager.onLoad === 'function') {
+            var _DataManager_onLoad = DataManager.onLoad;
+            DataManager.onLoad = function(object) {
+                var result = _DataManager_onLoad.apply(this, arguments);
+                if (typeof window !== 'undefined' && object === window.$dataActors) {
+                    translateActorDatabase();
+                }
+                return result;
+            };
+        }
+        if (typeof DataManager.extractSaveContents === 'function') {
+            var _DataManager_extractSaveContents = DataManager.extractSaveContents;
+            DataManager.extractSaveContents = function(contents) {
+                var result = _DataManager_extractSaveContents.apply(this, arguments);
+                translateGameActors();
+                return result;
+            };
+        }
+    }
+
+    // 老存档里的 Game_Actor._name 可能早于字典加载；名字 getter 再兜一层。
+    if (typeof Game_Actor !== 'undefined' && Game_Actor.prototype) {
+        for (var f = 0; f < ACTOR_FIELDS.length; f++) {
+            var fieldName = ACTOR_FIELDS[f];
+            if (typeof Game_Actor.prototype[fieldName] !== 'function') continue;
+            Game_Actor.prototype[fieldName] = (function(original) {
+                return function() {
+                    var value = original.apply(this, arguments);
+                    return typeof value === 'string' ? translate(value) : value;
+                };
+            })(Game_Actor.prototype[fieldName]);
+        }
+    }
 
     // 关窗时立即落盘，避免去抖定时器来不及触发
     if (typeof window !== 'undefined' && window.addEventListener) {
