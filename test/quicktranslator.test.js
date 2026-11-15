@@ -898,6 +898,10 @@ const done = (async function main() {
             await item.fn();
             console.log('ok - ' + item.name);
         } catch (err) {
+            if (err instanceof Skip) {
+                console.log('skip - ' + item.name + ' (' + err.message + ')');
+                continue;
+            }
             failed++;
             console.error('not ok - ' + item.name);
             console.error(err && err.stack ? err.stack : err);
