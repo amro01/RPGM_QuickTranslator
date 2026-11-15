@@ -898,7 +898,13 @@
         var data = window.$gameActors._data;
         if (!Array.isArray(data)) return;
         for (var i = 1; i < data.length; i++) {
-            translateActorEntry(data[i], GAME_ACTOR_FIELDS, data[i]._actorId || i);
+            // JsonEx 会把未入队角色的槽位还原成 null（不是 undefined），
+            // 这里必须先判空，否则读档在 DataManager.extractSaveContents 内抛
+            // “Cannot read property '_actorId' of null”，被 loadGame 的 try/catch
+            // 吞掉后表现为“读档失败”。
+            var actor = data[i];
+            if (!actor || typeof actor !== 'object') continue;
+            translateActorEntry(actor, GAME_ACTOR_FIELDS, actor._actorId || i);
         }
     }
 

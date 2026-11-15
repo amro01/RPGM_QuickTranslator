@@ -363,6 +363,31 @@ test('missing Japanese actor name is collected alone, never the Chinese composit
 });
 
 // ============================================================================
+// 场景 5a：JsonEx 还原的未入队角色槽位是 null，读档提取不得因此抛错
+// ============================================================================
+test('extractSaveContents skips null actor slots and translates loaded actors', function() {
+    const env = boot({
+        'たねお': '种子夫',
+        'タネコ': '种子子'
+    });
+    env.window.$gameActors = {
+        _data: [
+            null,
+            { _actorId: 1, _name: 'たねお', _nickname: '', _profile: '' },
+            null,
+            { _actorId: 2, _name: 'タネコ', _nickname: '', _profile: '' }
+        ]
+    };
+
+    env.DataManager.extractSaveContents({});
+
+    assert.deepStrictEqual(
+        env.window.$gameActors._data.map(function(actor) { return actor && actor._name; }),
+        [null, '种子夫', null, '种子子']
+    );
+});
+
+// ============================================================================
 // 场景 5b：\N[1] 已被外部展开但未经过 convert Hook 时，仍不得收集中文译文行
 // ============================================================================
 test('expanded actor-name template is recognized without convert Hook marking', function() {
